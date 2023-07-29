@@ -6,8 +6,7 @@ use serde_json::Value;
 use crate::{
     api::{
         core::{log_event, CipherSyncData, CipherSyncType},
-        ApiResult, EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, JsonVec, Notify, NumberOrString, PasswordData,
-        UpdateType,
+        EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, JsonVec, Notify, NumberOrString, PasswordData, UpdateType,
     },
     auth::{decode_invite, AdminHeaders, Headers, ManagerHeaders, ManagerHeadersLoose, OwnerHeaders},
     db::{models::*, DbConn},
@@ -126,6 +125,7 @@ struct NewCollectionData {
     Name: String,
     Groups: Vec<NewCollectionObjectData>,
     Users: Vec<NewCollectionObjectData>,
+    ExternalId: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -170,7 +170,7 @@ async fn create_organization(headers: Headers, data: JsonUpcase<OrgData>, mut co
 
     let org = Organization::new(data.Name, data.BillingEmail, private_key, public_key);
     let mut user_org = UserOrganization::new(headers.user.uuid, org.uuid.clone());
-    let collection = Collection::new(org.uuid.clone(), data.CollectionName);
+    let collection = Collection::new(org.uuid.clone(), data.CollectionName, None);
 
     user_org.akey = data.Key;
     user_org.access_all = true;
@@ -399,7 +399,7 @@ async fn post_organization_collections(
         None => err!("Can't find organization details"),
     };
 
-    let collection = Collection::new(org.uuid, data.Name);
+    let collection = Collection::new(org.uuid, data.Name, data.ExternalId);
     collection.save(&mut conn).await?;
 
     log_event(
@@ -431,6 +431,10 @@ async fn post_organization_collections(
 
         CollectionUser::save(&org_user.user_uuid, &collection.uuid, user.ReadOnly, user.HidePasswords, &mut conn)
             .await?;
+    }
+
+    if headers.org_user.atype == UserOrgType::Manager && !headers.org_user.access_all {
+        CollectionUser::save(&headers.org_user.user_uuid, &collection.uuid, false, false, &mut conn).await?;
     }
 
     Ok(Json(collection.to_json()))
@@ -472,6 +476,11 @@ async fn post_organization_collection_update(
     }
 
     collection.name = data.Name;
+    collection.external_id = match data.ExternalId {
+        Some(external_id) if !external_id.trim().is_empty() => Some(external_id),
+        _ => None,
+    };
+
     collection.save(&mut conn).await?;
 
     log_event(
@@ -858,6 +867,7 @@ struct CollectionData {
 #[allow(non_snake_case)]
 struct InviteData {
     Emails: Vec<String>,
+    Groups: Vec<String>,
     Type: NumberOrString,
     Collections: Option<Vec<CollectionData>>,
     AccessAll: Option<bool>,
@@ -936,6 +946,11 @@ async fn send_invite(
         }
 
         new_user.save(&mut conn).await?;
+
+        for group in data.Groups.iter() {
+            let mut group_entry = GroupUser::new(String::from(group), user.uuid.clone());
+            group_entry.save(&mut conn).await?;
+        }
 
         log_event(
             EventType::OrganizationUserInvited as i32,
@@ -1579,7 +1594,7 @@ async fn post_org_import(
 
     let mut collections = Vec::new();
     for coll in data.Collections {
-        let collection = Collection::new(org_id.clone(), coll.Name);
+        let collection = Collection::new(org_id.clone(), coll.Name, coll.ExternalId);
         if collection.save(&mut conn).await.is_err() {
             collections.push(Err(Error::new("Failed to create Collection", "Failed to create Collection")));
         } else {
@@ -2238,29 +2253,22 @@ struct GroupRequest {
 }
 
 impl GroupRequest {
-    pub fn to_group(&self, organizations_uuid: &str) -> ApiResult<Group> {
-        match self.AccessAll {
-            Some(access_all_value) => Ok(Group::new(
-                organizations_uuid.to_owned(),
-                self.Name.clone(),
-                access_all_value,
-                self.ExternalId.clone(),
-            )),
-            _ => err!("Could not convert GroupRequest to Group, because AccessAll has no value!"),
-        }
+    pub fn to_group(&self, organizations_uuid: &str) -> Group {
+        Group::new(
+            String::from(organizations_uuid),
+            self.Name.clone(),
+            self.AccessAll.unwrap_or(false),
+            self.ExternalId.clone(),
+        )
     }
 
-    pub fn update_group(&self, mut group: Group) -> ApiResult<Group> {
-        match self.AccessAll {
-            Some(access_all_value) => {
-                group.name = self.Name.clone();
-                group.access_all = access_all_value;
-                group.set_external_id(self.ExternalId.clone());
+    pub fn update_group(&self, mut group: Group) -> Group {
+        group.name = self.Name.clone();
+        group.access_all = self.AccessAll.unwrap_or(false);
+        // Group Updates do not support changing the external_id
+        // These input fields are in a disabled state, and can only be updated/added via ldap_import
 
-                Ok(group)
-            }
-            _ => err!("Could not update group, because AccessAll has no value!"),
-        }
+        group
     }
 }
 
@@ -2321,7 +2329,7 @@ async fn post_groups(
     }
 
     let group_request = data.into_inner().data;
-    let group = group_request.to_group(org_id)?;
+    let group = group_request.to_group(org_id);
 
     log_event(
         EventType::GroupCreated as i32,
@@ -2355,7 +2363,7 @@ async fn put_group(
     };
 
     let group_request = data.into_inner().data;
-    let updated_group = group_request.update_group(group)?;
+    let updated_group = group_request.update_group(group);
 
     CollectionGroup::delete_all_by_group(group_id, &mut conn).await?;
     GroupUser::delete_all_by_group(group_id, &mut conn).await?;
@@ -2600,10 +2608,14 @@ async fn put_user_groups(
         err!("Group support is disabled");
     }
 
-    match UserOrganization::find_by_uuid(org_user_id, &mut conn).await {
-        Some(_) => { /* Do nothing */ }
+    let user_org = match UserOrganization::find_by_uuid(org_user_id, &mut conn).await {
+        Some(uo) => uo,
         _ => err!("User could not be found!"),
     };
+
+    if user_org.org_uuid != org_id {
+        err!("Group doesn't belong to organization");
+    }
 
     GroupUser::delete_all_by_user(org_user_id, &mut conn).await?;
 
@@ -2650,15 +2662,23 @@ async fn delete_group_user(
         err!("Group support is disabled");
     }
 
-    match UserOrganization::find_by_uuid(org_user_id, &mut conn).await {
-        Some(_) => { /* Do nothing */ }
+    let user_org = match UserOrganization::find_by_uuid(org_user_id, &mut conn).await {
+        Some(uo) => uo,
         _ => err!("User could not be found!"),
     };
 
-    match Group::find_by_uuid(group_id, &mut conn).await {
-        Some(_) => { /* Do nothing */ }
+    if user_org.org_uuid != org_id {
+        err!("User doesn't belong to organization");
+    }
+
+    let group = match Group::find_by_uuid(group_id, &mut conn).await {
+        Some(g) => g,
         _ => err!("Group could not be found!"),
     };
+
+    if group.organizations_uuid != org_id {
+        err!("Group doesn't belong to organization");
+    }
 
     log_event(
         EventType::OrganizationUserUpdatedGroups as i32,
@@ -2678,6 +2698,7 @@ async fn delete_group_user(
 #[allow(non_snake_case)]
 struct OrganizationUserResetPasswordEnrollmentRequest {
     ResetPasswordKey: Option<String>,
+    MasterPasswordHash: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2857,6 +2878,17 @@ async fn put_reset_password_enrollment(
     if reset_request.ResetPasswordKey.is_none() && OrgPolicy::org_is_reset_password_auto_enroll(org_id, &mut conn).await
     {
         err!("Reset password can't be withdrawed due to an enterprise policy");
+    }
+
+    if reset_request.ResetPasswordKey.is_some() {
+        match reset_request.MasterPasswordHash {
+            Some(password) => {
+                if !headers.user.check_valid_password(&password) {
+                    err!("Invalid or wrong password")
+                }
+            }
+            None => err!("No password provided"),
+        };
     }
 
     org_user.reset_password_key = reset_request.ResetPasswordKey;
