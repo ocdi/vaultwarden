@@ -9,6 +9,7 @@ data
 .env.template
 .gitattributes
 .gitignore
+.git
 rustfmt.toml
 
 # IDE files
@@ -38,3 +39,4 @@ web-vault
 
 # Vaultwarden Resources
 resources
+
