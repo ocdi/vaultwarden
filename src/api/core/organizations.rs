@@ -40,6 +40,7 @@ pub fn routes() -> Vec<Route> {
         post_organization_collection_delete,
         bulk_delete_organization_collections,
         get_org_details,
+        get_org_domain_sso_details,
         get_org_users,
         send_invite,
         reinvite_user,
@@ -776,6 +777,14 @@ async fn get_org_details(data: OrgIdData, headers: Headers, mut conn: DbConn) ->
         "Object": "list",
         "ContinuationToken": null,
     }))
+}
+
+#[post("/organizations/domain/sso/details")]
+fn get_org_domain_sso_details() -> JsonResult {
+    Ok(Json(json!({
+        "organizationIdentifier": "valid",
+        "ssoAvailable": CONFIG.sso_enabled()
+    })))
 }
 
 async fn _get_org_details(org_id: &str, host: &str, user_uuid: &str, conn: &mut DbConn) -> Value {
