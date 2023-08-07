@@ -183,7 +183,10 @@ async fn _authorization_login(
                     // let expiry = token.exp;
                     let user_email = match token.email {
                         Some(email) => email,
-                        None => userinfo.email().unwrap().to_owned().to_string(),
+                        None => match userinfo.email() {
+                            Some(e) => e.to_owned().to_string(),
+                            None => err!("Email address not present in token or user info"),
+                        },
                     };
                     let now = Utc::now().naive_utc();
 
