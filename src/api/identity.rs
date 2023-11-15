@@ -174,7 +174,7 @@ async fn _authorization_login(
         None => None,
         Some(user) => {
             let (mut device, new_device) = get_device(&data, conn, &user).await;
-            let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, ip, conn).await?;
+            let twofactor_token = twofactor_auth(&user.uuid, &user.email, &data, &mut device, ip, conn).await?;
 
             Some((user, device, new_device, twofactor_token))
         }
@@ -313,7 +313,7 @@ async fn _password_login(
 
     let (mut device, new_device) = get_device(&data, conn, &user).await;
 
-    let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, ip, conn).await?;
+    let twofactor_token = twofactor_auth(&user.uuid, &user.email, &data, &mut device, ip, conn).await?;
 
     authenticated_response(scope, scope_vec, &user, &mut device, new_device, twofactor_token, &now, conn, ip).await
 }
@@ -553,6 +553,7 @@ async fn get_device(data: &ConnectData, conn: &mut DbConn, user: &User) -> (Devi
 
 async fn twofactor_auth(
     user_uuid: &str,
+    user_email: &str,
     data: &ConnectData,
     device: &mut Device,
     ip: &ClientIp,
@@ -591,9 +592,7 @@ async fn twofactor_auth(
             _tf::webauthn::validate_webauthn_login(user_uuid, twofactor_code, conn).await?
         }
         Some(TwoFactorType::YubiKey) => _tf::yubikey::validate_yubikey_login(twofactor_code, &selected_data?).await?,
-        Some(TwoFactorType::Duo) => {
-            _tf::duo::validate_duo_login(data.username.as_ref().unwrap().trim(), twofactor_code, conn).await?
-        }
+        Some(TwoFactorType::Duo) => _tf::duo::validate_duo_login(user_email, twofactor_code, conn).await?,
         Some(TwoFactorType::Email) => {
             _tf::email::validate_email_code_str(user_uuid, twofactor_code, &selected_data?, conn).await?
         }
